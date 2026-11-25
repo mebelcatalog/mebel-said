@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /admin.html
+Disallow: /tools/
+
+Sitemap: https://mebelcatalog.github.io/mebel-said/sitemap.xml

@@ -1,0 +1,801 @@
+/* ==========================================================================
+   Mebel Said — админка
+   Сайт статичный, поэтому изменения сохраняются коммитом в GitHub-репозиторий
+   сайта (GitHub Pages / Netlify / Vercel пересобирают сайт сами).
+
+   Доступ: личная ссылка admin.html#key=… В ней зашифрованы репозиторий и токен
+   GitHub (AES-GCM, ключ из пароля через PBKDF2). Без пароля ссылка бесполезна,
+   а часть после # браузер никогда не отправляет на сервер.
+   ========================================================================== */
+(function () {
+  "use strict";
+
+  var SITE = window.SITE;
+  var API = "https://api.github.com";
+
+  /* ---------- Утилиты ---------- */
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function icon(name) { return '<svg class="icon" aria-hidden="true"><use href="#i-' + name + '"/></svg>'; }
+  function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+  function plural(n, f) { var a = n % 100, b = a % 10; return a > 10 && a < 20 ? f[2] : b > 1 && b < 5 ? f[1] : b === 1 ? f[0] : f[2]; }
+  function show(id) { ["screenSetup", "screenPin", "screenApp"].forEach(function (s) { $("#" + s).hidden = s !== id; }); }
+  function storage(kind) { try { return window[kind]; } catch (e) { return null; } }
+  var SS = storage("sessionStorage"), LS = storage("localStorage");
+
+  var toastTimer;
+  function toast(text) {
+    var t = $("#toast");
+    t.textContent = text;
+    t.classList.add("is-shown");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.remove("is-shown"); }, 3600);
+  }
+  function busy(text) { $("#busy").hidden = !text; if (text) $("#busyText").textContent = text; }
+  function fail(box, err) { box.textContent = err.message || String(err); box.hidden = false; }
+
+  // Основной адрес сайта для превью-ссылок: из config.js, из личной ссылки или по месту, где открыта админка.
+  // На Vercel у каждой сборки есть свой временный адрес — превью должны вести на основной.
+  function normBase(u) { return String(u).trim().replace(/\/?$/, "/"); }
+  var HERE = location.origin + location.pathname.replace(/[^/]*$/, "");
+  function siteBase() { return normBase(SITE.siteUrl || (C && C.site) || HERE); }
+
+  /* ---------- Шифрование личной ссылки ---------- */
+  var te = new TextEncoder(), td = new TextDecoder();
+  function b64u(bytes) {
+    var s = ""; bytes.forEach(function (b) { s += String.fromCharCode(b); });
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function unb64u(str) {
+    var s = atob(str.replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from(s, function (c) { return c.charCodeAt(0); });
+  }
+  function deriveKey(pass, salt) {
+    return crypto.subtle.importKey("raw", te.encode(pass), "PBKDF2", false, ["deriveKey"]).then(function (base) {
+      return crypto.subtle.deriveKey({ name: "PBKDF2", salt: salt, iterations: 310000, hash: "SHA-256" },
+        base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    });
+  }
+  async function seal(obj, pass) {
+    var salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    var ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, await deriveKey(pass, salt), te.encode(JSON.stringify(obj))));
+    var out = new Uint8Array(1 + 16 + 12 + ct.length);
+    out[0] = 1; out.set(salt, 1); out.set(iv, 17); out.set(ct, 29);
+    return b64u(out);
+  }
+  async function unseal(key, pass) {
+    var raw = unb64u(key);
+    if (raw[0] !== 1) throw new Error("Ссылка повреждена");
+    var pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: raw.slice(17, 29) }, await deriveKey(pass, raw.slice(1, 17)), raw.slice(29));
+    return JSON.parse(td.decode(pt));
+  }
+
+  /* ---------- GitHub API ---------- */
+  var C = null; // { repo, branch, token }
+
+  async function gh(path, opts, creds) {
+    opts = opts || {};
+    var r = await fetch(API + path, {
+      method: opts.method || "GET",
+      headers: {
+        Authorization: "Bearer " + (creds || C).token,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      cache: "no-store",
+    });
+    if (r.ok) return r.status === 204 ? null : r.json();
+    var msg = "";
+    try { msg = (await r.json()).message || ""; } catch (e) {}
+    var text = {
+      401: "Токен GitHub недействителен или истёк — создайте новую личную ссылку.",
+      403: "GitHub отказал в доступе. Проверьте, что у токена есть Contents: Read and write.",
+      404: "Репозиторий или ветка не найдены (или у токена нет к ним доступа).",
+      409: "В репозитории одновременно идут другие изменения — попробуйте ещё раз.",
+      422: "GitHub не принял изменения.",
+    }[r.status] || "Ошибка GitHub (" + r.status + ").";
+    throw new Error(text + (msg ? " [" + msg + "]" : ""));
+  }
+
+  function normRepo(s) {
+    return s.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/+$/, "");
+  }
+
+  async function verify(creds) {
+    var repo = await gh("/repos/" + creds.repo, null, creds);
+    if (repo.permissions && !repo.permissions.push) throw new Error("У этого аккаунта нет права записи в репозиторий.");
+    await gh("/repos/" + creds.repo + "/branches/" + encodeURIComponent(creds.branch), null, creds);
+  }
+
+  function decodeB64Utf8(b64) { return td.decode(Uint8Array.from(atob(b64.replace(/\n/g, "")), function (c) { return c.charCodeAt(0); })); }
+
+  // Свежее состояние репозитория: последний коммит, все пути файлов и данные раздела
+  async function loadRepo(cat) {
+    var ref = await gh("/repos/" + C.repo + "/git/ref/heads/" + encodeURIComponent(C.branch));
+    var commit = await gh("/repos/" + C.repo + "/git/commits/" + ref.object.sha);
+    var tree = await gh("/repos/" + C.repo + "/git/trees/" + commit.tree.sha + "?recursive=1");
+    var paths = {};
+    tree.tree.forEach(function (t) { if (t.type === "blob") paths[t.path] = t.sha; });
+    var dataPath = "data/" + cat.id + ".js";
+    var parsed = { head: defaultHead(cat), items: [] };
+    if (paths[dataPath]) {
+      var blob = await gh("/repos/" + C.repo + "/git/blobs/" + paths[dataPath]);
+      parsed = parseData(decodeB64Utf8(blob.content), cat);
+    }
+    return { commit: ref.object.sha, tree: commit.tree.sha, paths: paths, dataPath: dataPath, head: parsed.head, items: parsed.items };
+  }
+
+  async function uploadBlob(b64) {
+    return (await gh("/repos/" + C.repo + "/git/blobs", { method: "POST", body: { content: b64, encoding: "base64" } })).sha;
+  }
+
+  // Один коммит со всеми изменениями: [{ path, content } | { path, sha } | { path, remove: true }]
+  async function commit(repo, message, entries) {
+    var tree = await gh("/repos/" + C.repo + "/git/trees", { method: "POST", body: {
+      base_tree: repo.tree,
+      tree: entries.map(function (e) {
+        var t = { path: e.path, mode: "100644", type: "blob" };
+        if (e.remove) t.sha = null; else if (e.content != null) t.content = e.content; else t.sha = e.sha;
+        return t;
+      }),
+    } });
+    var c = await gh("/repos/" + C.repo + "/git/commits", { method: "POST", body: { message: message, tree: tree.sha, parents: [repo.commit] } });
+    await gh("/repos/" + C.repo + "/git/refs/heads/" + encodeURIComponent(C.branch), { method: "PATCH", body: { sha: c.sha } });
+    return c.sha;
+  }
+
+  /* ---------- Файл данных раздела (data/<раздел>.js) ---------- */
+  function marker(cat) { return "window.CATALOG." + cat.id + " = ["; }
+  function defaultHead(cat) {
+    return "/*\n * Каталог: " + cat.title.toUpperCase() + "\n * Формат — см. data/kitchens.js\n */\nwindow.CATALOG = window.CATALOG || {};\n" + marker(cat);
+  }
+  function parseData(text, cat) {
+    var i = text.indexOf(marker(cat));
+    if (i < 0) throw new Error("Не нашёл список моделей в data/" + cat.id + ".js");
+    var head = text.slice(0, i + marker(cat).length);
+    var body = text.slice(i + marker(cat).length, text.lastIndexOf("];")).trim().replace(/,\s*$/, "");
+    return { head: head, items: JSON.parse("[" + body + "]") };
+  }
+  // Последний выданный номер хранится в шапке файла, чтобы номер удалённой модели
+  // не достался новой (иначе старые ссылки и переписки укажут на другую кухню)
+  var LAST_ID = /\/\/ Последний выданный номер: (\d+)\n/;
+  function nextId(repo) {
+    var m = repo.head.match(LAST_ID);
+    return repo.items.reduce(function (mx, p) { return Math.max(mx, p.id); }, m ? +m[1] : 0) + 1;
+  }
+  function withLastId(head, id) {
+    var line = "// Последний выданный номер: " + id + "\n";
+    if (LAST_ID.test(head)) return head.replace(LAST_ID, function (all, cur) { return +cur >= id ? all : line; });
+    var at = head.indexOf("window.CATALOG = ");
+    return at < 0 ? line + head : head.slice(0, at) + line + head.slice(at);
+  }
+  // Формат строки как в исходном файле: одна модель — одна строка
+  function fmt(o) {
+    return "{" + Object.keys(o).map(function (k) {
+      var v = o[k];
+      return JSON.stringify(k) + ": " + (Array.isArray(v) ? "[" + v.map(function (x) { return JSON.stringify(x); }).join(", ") + "]" : JSON.stringify(v));
+    }).join(", ") + "}";
+  }
+  function buildData(head, items) {
+    return head + "\n" + items.map(function (o) { return "  " + fmt(o) + ","; }).join("\n") + "\n];\n";
+  }
+
+  /* ---------- Страница-превью модели (карточка в WhatsApp/MAX) ---------- */
+  // Страница модели для поиска и мессенджеров: копия index.html со своими мета-тегами.
+  // Та же логика — в tools/make-share-pages.py (page).
+  var TPL = null;
+  async function template() {
+    if (!TPL) TPL = await (await fetch("index.html", { cache: "no-store" })).text();
+    return TPL;
+  }
+  function sharePage(p, cat, tpl) {
+    var base = siteBase(), path = cat.id + "/" + p.id + "/", url = base + path;
+    var img = base + "photos/" + cat.id + "/thumbs/" + p.id + "_1.jpg?v=" + Date.now().toString(36);
+    var one = p.type === "Банкетка" ? "банкетка" : cat.nameByType && p.type ? p.type.split(" / ")[0].toLowerCase() : cat.one;
+    var nn = p.name.toLowerCase(), generic = nn === one.toLowerCase() || nn === (p.type || "").toLowerCase() || nn.indexOf(one.toLowerCase() + " ") === 0;
+    var title = cap(one) + (generic ? p.name.slice(one.length) : " «" + p.name + "»") + " · № " + p.id + " — " + SITE.brand;
+    var desc = [p.type, p.sizes.length ? p.sizes.join(" / ") + (p.sizes.every(function (s) { return /^[Ø\d\s.,×–-]+$/.test(s); }) ? " см" : "") : "", p.colors.join(", "), p.producer].filter(Boolean).join(" · ") +
+      ". Мебель в каталоге — " + SITE.brand + ".";
+    var t = tpl.replace(/\s*<(?:base|link rel="canonical"|meta property="og:url"|meta property="og:image"|meta name="twitter:card")[^>]*>/g, "");
+    t = t.replace(/<title>[^<]*<\/title>/, function () { return "<title>" + esc(title) + "</title>"; });
+    t = t.replace(/<meta name="description" content="[^"]*">/, function () { return '<meta name="description" content="' + esc(desc) + '">'; });
+    t = t.replace(/<meta property="og:title" content="[^"]*">/, function () { return '<meta property="og:title" content="' + esc(title) + '">'; });
+    t = t.replace(/<meta property="og:description" content="[^"]*">/, function () { return '<meta property="og:description" content="' + esc(desc) + '">'; });
+    var head = ['<base href="' + esc(base) + '">', '<link rel="canonical" href="' + esc(url) + '">', '<meta property="og:url" content="' + esc(url) + '">',
+      '<meta property="og:image" content="' + esc(img) + '">', '<meta name="twitter:card" content="summary_large_image">'].join("\n");
+    t = t.replace('<meta charset="utf-8">', function () { return '<meta charset="utf-8">\n' + head; });
+    var start = "<script>window.FF_START=" + JSON.stringify({ cat: cat.id, id: p.id }).replace(/</g, "\\u003c") + ";</script>\n";
+    return t.replace('<script src="data/config.js"></script>', function () { return start + '<script src="data/config.js"></script>'; });
+  }
+
+  /* ---------- Фото: сжатие в браузере ---------- */
+  function readImage(file) {
+    return new Promise(function (ok, no) {
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () { ok({ img: img, url: url }); };
+      img.onerror = function () { no(new Error("Не получилось открыть «" + file.name + "». Нужен JPEG или PNG (фото с iPhone в HEIC сохраните как JPEG).")); };
+      img.src = url;
+    });
+  }
+  function toJpeg(img, max, quality) {
+    var k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    var c = document.createElement("canvas");
+    c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+    var ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height); // прозрачный PNG → белый фон
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", quality).split(",")[1];
+  }
+
+  /* ---------- Состояние админки ---------- */
+  var S = { cat: SITE.categories[0], repo: null, q: "", order: null };  // order — номера в новом порядке, пока не сохранён
+  var E = null; // редактируемая модель
+
+  function rawUrl(path) {
+    // Свежие фото из репозитория (сайт обновляется с задержкой); если репозиторий закрытый — с сайта
+    return "https://raw.githubusercontent.com/" + C.repo + "/" + S.repo.commit + "/" + path;
+  }
+  function photoSrc(id, n, thumb) {
+    return "photos/" + S.cat.id + "/" + (thumb ? "thumbs/" : "") + id + "_" + n + ".jpg";
+  }
+  function imgTag(path, alt) {
+    return '<img src="' + esc(rawUrl(path)) + '" alt="' + esc(alt || "") + '" loading="lazy" onerror="this.onerror=null;this.src=\'' + esc(path) + '\'">';
+  }
+
+  async function reload() {
+    S.repo = await loadRepo(S.cat);
+    renderList();
+  }
+
+  function renderCats() {
+    $("#aCats").innerHTML = SITE.categories.map(function (c) {
+      return '<button class="cat-tab' + (c === S.cat ? " is-active" : "") + '" type="button" data-cat="' + c.id + '">' + esc(c.title) + "</button>";
+    }).join("");
+  }
+
+  function renderList() {
+    var q = S.q.toLowerCase().replace(/[№#]/g, "").trim();
+    // Список — в том порядке, в каком модели стоят на сайте
+    var byId = {};
+    S.repo.items.forEach(function (p) { byId[p.id] = p; });
+    var ordered = S.order ? S.order.map(function (id) { return byId[id]; }).filter(Boolean) : S.repo.items.slice();
+    var items = ordered.filter(function (p) {
+      return !q || String(p.id) === q || (p.name + " " + p.producer).toLowerCase().indexOf(q) >= 0;
+    });
+    var canMove = !q;  // при поиске стрелки прячем — непонятно, относительно чего двигать
+    $("#orderBar").hidden = !S.order;
+    $("#aHint").hidden = !canMove;
+    var n = S.repo.items.length;
+    $("#aCount").textContent = S.cat.title + ": " + n + " " + plural(n, ["модель", "модели", "моделей"]) + (q ? " · найдено " + items.length : "");
+    $("#aList").innerHTML = items.map(function (p, i) {
+      return '<div class="a-row"><button class="a-item" type="button" data-edit="' + p.id + '">' + imgTag(photoSrc(p.id, 1, true)) +
+        "<span><b>" + esc(p.name) + "</b><small>" + esc([p.type, p.sizes.join(" / "), p.producer].filter(Boolean).join(" · ")) + "</small></span>" +
+        '<span class="tag tag--num">№ ' + p.id + "</span></button>" +
+        (canMove ? '<div class="a-move">' +
+          '<button type="button" data-order="top" data-id="' + p.id + '" aria-label="Поставить первой"' + (i === 0 ? " disabled" : "") + ">" + icon("top") + "</button>" +
+          '<button type="button" data-order="-1" data-id="' + p.id + '" aria-label="Выше"' + (i === 0 ? " disabled" : "") + ">" + icon("up") + "</button>" +
+          '<button type="button" data-order="1" data-id="' + p.id + '" aria-label="Ниже"' + (i === items.length - 1 ? " disabled" : "") + ">" + icon("down") + "</button>" +
+          "</div>" : "") + "</div>";
+    }).join("") || '<p class="muted">Ничего не найдено</p>';
+  }
+
+  /* ---------- Слои ---------- */
+  var timers = {};
+  function openLayer(el) {
+    clearTimeout(timers[el.id]);
+    el.hidden = false; el.offsetHeight; el.classList.add("is-open");
+    document.documentElement.classList.add("is-locked");
+    history.pushState({ adm: el.id }, "", location.href); // «назад» на телефоне закрывает окно
+  }
+  function hideLayer(el) {
+    if (el.hidden) return;
+    el.classList.remove("is-open");
+    timers[el.id] = setTimeout(function () { el.hidden = true; }, 380);
+    if (!$(".layer.is-open")) document.documentElement.classList.remove("is-locked");
+  }
+  function closeLayer(el) {
+    if (el.id === "editLayer" && E && E.dirty && !confirm("Закрыть без сохранения?")) return;
+    if (history.state && history.state.adm === el.id) history.back(); else hideLayer(el);
+  }
+  window.addEventListener("popstate", function () {
+    $$(".layer.is-open").forEach(function (l) {
+      if (l.id === "editLayer" && E && E.dirty && !confirm("Закрыть без сохранения?")) { history.pushState({ adm: l.id }, "", location.href); return; }
+      hideLayer(l);
+    });
+  });
+
+  /* ---------- Редактор ---------- */
+  function openEditor(item) {
+    if (S.order && !confirm("Порядок моделей изменён, но не сохранён. Продолжить без сохранения порядка?")) return;
+    if (S.order) { S.order = null; renderList(); }
+    var isNew = !item;
+    E = {
+      isNew: isNew,
+      id: isNew ? nextId(S.repo) : item.id,
+      photos: isNew ? [] : Array.from({ length: item.photos }, function (_, i) { return { old: i + 1 }; }),
+      link: isNew ? null : item.link || null,
+      colorPhotos: isNew ? null : item.colorPhotos || null,  // привязка цветов к фото — пока цвета и фото не меняли
+      colorsWas: isNew ? "" : (item.colors || []).join("|"), photosWas: isNew ? 0 : item.photos,  // связь тройка ↔ кресло — админка её не меняет, только сохраняет
+      dirty: false,
+    };
+    var f = $("#editForm");
+    f.reset();
+    // Тип — галочками: у модели может быть несколько вариантов («4 двери / 6 дверей»)
+    var cur = isNew ? [] : (item.type ? item.type.split(/\s+\/\s+/) : []);
+    $("#eType").innerHTML = S.cat.types.map(function (t) {
+      return '<label class="chip type-chip' + (cur.indexOf(t) >= 0 ? " is-on" : "") + '"><input type="checkbox" value="' + esc(t) + '"' +
+        (cur.indexOf(t) >= 0 ? " checked" : "") + ">" + esc(t) + "</label>";
+    }).join("");
+    $("#eTypeLabel").textContent = S.cat.typeName || "Тип";
+    $("#eSizesLabel").textContent = (S.cat.sizeName || "Размеры") + ", см — через запятую";
+    $("#editForm").sizes.placeholder = S.cat.id === "bedrooms" ? "180×200  или  160×200, 180×200" : "300, 360  или  395×275, 210×450";
+    var producers = {};
+    S.repo.items.forEach(function (p) { if (p.producer) producers[p.producer] = 1; });
+    $("#eProducers").innerHTML = Object.keys(producers).sort().map(function (p) { return '<option value="' + esc(p) + '">'; }).join("");
+    f.id.value = "№ " + E.id;
+    f.name.value = isNew ? "" : item.name;
+    f.producer.value = isNew ? "" : item.producer;
+    f.sizes.value = isNew ? "" : item.sizes.join(", ");
+    f.colors.value = isNew ? "" : item.colors.join(", ");
+    f.desc.value = isNew ? "" : item.desc;
+    $("#eTitle").textContent = isNew ? "Новая модель" : "№ " + item.id + " · " + item.name;
+    $("#deleteBtn").hidden = isNew;
+    $("#editError").hidden = true;
+    renderPhotos();
+    openLayer($("#editLayer"));
+    $("#editLayer .sheet-scroll").scrollTop = 0;
+  }
+
+  function renderPhotos() {
+    var n = E.photos.length;
+    $("#ePhotos").innerHTML = E.photos.map(function (ph, i) {
+      var img = ph.old ? imgTag(photoSrc(E.id, ph.old, true)) : '<img src="' + ph.url + '" alt="">';
+      return '<div class="photo' + (i === 0 ? " is-main" : "") + '">' + img +
+        '<span class="photo-num">' + (i + 1) + "</span>" + (ph.old ? "" : '<span class="photo-new">новое</span>') +
+        '<div class="photo-tools">' +
+          '<button type="button" data-move="' + i + '" data-dir="-1" aria-label="Левее"' + (i === 0 ? " disabled" : "") + ">" + icon("left") + "</button>" +
+          '<button type="button" data-drop="' + i + '" aria-label="Убрать фото">' + icon("trash") + "</button>" +
+          '<button type="button" data-move="' + i + '" data-dir="1" aria-label="Правее"' + (i === n - 1 ? " disabled" : "") + ">" + icon("right") + "</button>" +
+        "</div></div>";
+    }).join("");
+  }
+
+  async function addFiles(files) {
+    var list = Array.prototype.slice.call(files);
+    for (var i = 0; i < list.length; i++) {
+      busy("Сжимаю фото " + (i + 1) + " из " + list.length + "…");
+      try {
+        var r = await readImage(list[i]);
+        E.photos.push({ url: r.url, full: toJpeg(r.img, 1600, 0.82), thumb: toJpeg(r.img, 800, 0.6) });
+        E.dirty = true;
+      } catch (err) { toast(err.message); }
+    }
+    busy(false);
+    renderPhotos();
+  }
+
+  function splitList(s) { return s.split(/\s*[,;]\s*|\s+\/\s+/).map(function (x) { return x.trim(); }).filter(Boolean); }
+  function normSize(s) { return s.replace(/см\.?/gi, "").replace(/\s+/g, "").replace(/[xхXХ*]/g, "×"); }
+
+  function readForm() {
+    var f = $("#editForm");
+    var rec = {
+      id: E.id,
+      name: f.name.value.trim(),
+      type: $$("#eType input:checked").map(function (c) { return c.value; }).join(" / "),
+      producer: f.producer.value.trim(),
+      colors: splitList(f.colors.value).map(cap),
+      sizes: splitList(f.sizes.value).map(S.cat.sizeFree ? function (s) { return s.trim(); } : normSize),
+      desc: f.desc.value.replace(/\s*\n\s*/g, ", ").trim().replace(/,\s*$/, ""),
+      photos: E.photos.length,
+    };
+    if (E.colorPhotos && rec.colors.join("|") === E.colorsWas && rec.photos === E.photosWas) rec.colorPhotos = E.colorPhotos;
+    if (E.link) rec.link = E.link;
+    if (!rec.name) throw new Error("Укажите название.");
+    if (!rec.photos) throw new Error("Добавьте хотя бы одно фото.");
+    var bad = S.cat.sizeFree ? [] : rec.sizes.filter(function (s) { return !/^(Ø)?\d+([.,]\d+)?(–\d+)?(×\d+([.,]\d+)?(–\d+)?)*$/.test(s); });
+    if (bad.length) throw new Error("Не понял размер: " + bad.join(", ") + ". Пишите числа в см, например 300, 395×275, 120–160×80 или Ø120.");
+    return rec;
+  }
+
+  async function save() {
+    var rec = readForm();
+    busy("Проверяю репозиторий…");
+    var repo = await loadRepo(S.cat);
+    var base = "photos/" + S.cat.id + "/";
+    var prev = repo.items.filter(function (p) { return p.id === E.id; })[0];
+    if (E.isNew) {
+      // Пока форма была открыта, номер мог занять кто-то ещё
+      rec.id = nextId(repo);
+    } else if (!prev) {
+      throw new Error("Модель № " + E.id + " уже удалена из репозитория.");
+    }
+    var id = rec.id, entries = [];
+    var toUpload = E.photos.filter(function (p) { return !p.old; }).length, uploaded = 0;
+
+    for (var i = 0; i < E.photos.length; i++) {
+      var ph = E.photos[i], n = i + 1;
+      var full = base + id + "_" + n + ".jpg", thumb = base + "thumbs/" + id + "_" + n + ".jpg";
+      if (ph.old) {
+        if (ph.old === n) continue; // фото осталось на своём месте
+        var fs = repo.paths[base + id + "_" + ph.old + ".jpg"];
+        var ts = repo.paths[base + "thumbs/" + id + "_" + ph.old + ".jpg"] || fs;
+        if (!fs) throw new Error("В репозитории нет фото " + id + "_" + ph.old + ".jpg");
+        entries.push({ path: full, sha: fs }, { path: thumb, sha: ts });
+      } else {
+        busy("Загружаю фото " + (++uploaded) + " из " + toUpload + "…");
+        entries.push({ path: full, sha: await uploadBlob(ph.full) }, { path: thumb, sha: await uploadBlob(ph.thumb) });
+      }
+    }
+    // Лишние старые фото (если их стало меньше)
+    for (var k = E.photos.length + 1; k <= (prev ? prev.photos : 0); k++) {
+      [base + id + "_" + k + ".jpg", base + "thumbs/" + id + "_" + k + ".jpg"].forEach(function (p) {
+        if (repo.paths[p]) entries.push({ path: p, remove: true });
+      });
+    }
+    // Новая модель встаёт первой (новинки — в начале каталога), правка остаётся на своём месте
+    var items = prev ? repo.items.map(function (p) { return p.id === id ? rec : p; }) : [rec].concat(repo.items);
+    entries.push({ path: repo.dataPath, content: buildData(withLastId(repo.head, id), items) });
+    entries.push({ path: S.cat.id + "/" + id + "/index.html", content: sharePage(rec, S.cat, await template()) });
+
+    busy("Сохраняю…");
+    await commit(repo, (E.isNew ? "Админка: добавлена модель № " : "Админка: изменена модель № ") + id + " «" + rec.name + "»", entries);
+    E.dirty = false;
+    await reload();
+    busy(false);
+    closeLayer($("#editLayer"));
+    toast("Сохранено: № " + id + " «" + rec.name + "». На сайте появится через 1–2 минуты.");
+  }
+
+  async function removeItem() {
+    var repo = S.repo, p = repo.items.filter(function (x) { return x.id === E.id; })[0];
+    if (!p) return;
+    // Подтверждение номером модели — одним случайным нажатием «ОК» модель не удалить
+    var answer = prompt("Удалить модель № " + p.id + " «" + p.name + "» вместе с фото?\nЧтобы подтвердить, введите её номер: " + p.id);
+    if (answer === null) return;
+    if (answer.replace(/[^\d]/g, "") !== String(p.id)) { toast("Номер не совпал — модель не удалена"); return; }
+    busy("Удаляю…");
+    repo = await loadRepo(S.cat);
+    p = repo.items.filter(function (x) { return x.id === E.id; })[0];
+    if (!p) throw new Error("Модель уже удалена.");
+    var base = "photos/" + S.cat.id + "/", entries = [];
+    for (var k = 1; k <= p.photos; k++) {
+      [base + p.id + "_" + k + ".jpg", base + "thumbs/" + p.id + "_" + k + ".jpg"].forEach(function (path) {
+        if (repo.paths[path]) entries.push({ path: path, remove: true });
+      });
+    }
+    var page = S.cat.id + "/" + p.id + "/index.html";
+    if (repo.paths[page]) entries.push({ path: page, remove: true });
+    var maxId = repo.items.reduce(function (mx, x) { return Math.max(mx, x.id); }, 0);
+    entries.push({ path: repo.dataPath, content: buildData(withLastId(repo.head, maxId), repo.items.filter(function (x) { return x.id !== p.id; })) });
+    await commit(repo, "Админка: удалена модель № " + p.id + " «" + p.name + "»", entries);
+    E.dirty = false;
+    await reload();
+    busy(false);
+    closeLayer($("#editLayer"));
+    toast("Модель № " + p.id + " удалена. Её номер больше не используется.");
+  }
+
+  /* ---------- Порядок моделей ---------- */
+  function moveItem(id, how) {
+    var order = S.order || S.repo.items.map(function (p) { return p.id; });
+    var i = order.indexOf(id);
+    order.splice(i, 1);
+    var j = how === "top" ? 0 : Math.max(0, Math.min(order.length, i + how));
+    order.splice(j, 0, id);
+    var same = order.every(function (x, k) { return S.repo.items[k] && S.repo.items[k].id === x; });
+    S.order = same ? null : order;
+    renderList();
+  }
+
+  async function saveOrder() {
+    busy("Сохраняю порядок…");
+    var repo = await loadRepo(S.cat);
+    var byId = {};
+    repo.items.forEach(function (p) { byId[p.id] = p; });
+    // Модели, добавленные с другого устройства, пока ты двигал, — встают в начало
+    var known = {};
+    S.order.forEach(function (id) { known[id] = 1; });
+    var items = repo.items.filter(function (p) { return !known[p.id]; })
+      .concat(S.order.map(function (id) { return byId[id]; }).filter(Boolean));
+    await commit(repo, "Админка: изменён порядок раздела «" + S.cat.title + "»", [{ path: repo.dataPath, content: buildData(repo.head, items) }]);
+    S.order = null;
+    await reload();
+    busy(false);
+    toast("Порядок сохранён. На сайте обновится через 1–2 минуты.");
+  }
+
+  async function rebuildShare() {
+    if (/^https?:\/\/(localhost|127\.)/.test(siteBase()) &&
+      !confirm("Превью будут вести на " + siteBase() + " — мессенджеры не увидят такой адрес. Укажите основной адрес сайта при создании личной ссылки. Продолжить?")) return;
+    busy("Создаю превью-ссылки…");
+    var repo = await loadRepo(S.cat);
+    var tpl = await template();
+    var entries = repo.items.map(function (p) { return { path: S.cat.id + "/" + p.id + "/index.html", content: sharePage(p, S.cat, tpl) }; });
+    await commit(repo, "Админка: превью-ссылки для раздела «" + S.cat.title + "»", entries);
+    await reload();
+    busy(false);
+    closeLayer($("#menuLayer"));
+    toast("Готово: " + entries.length + " " + plural(entries.length, ["превью", "превью", "превью"]) + " для " + siteBase());
+  }
+
+  /* ---------- Экраны входа ---------- */
+  function keyFromHash() { return new URLSearchParams(location.hash.slice(1)).get("key"); }
+
+  function sessionCreds(key) {
+    try { var s = JSON.parse(SS.getItem("ff-admin") || "null"); return s && s.key === key ? s.creds : null; } catch (e) { return null; }
+  }
+
+  function prefillSetup(creds) {
+    var f = $("#setupForm");
+    var m = location.hostname.match(/^([^.]+)\.github\.io$/);
+    f.site.value = (creds && creds.site) || SITE.siteUrl || HERE;
+    if (creds) { f.repo.value = creds.repo; f.branch.value = creds.branch; f.token.value = creds.token; }
+    else if (m) { var seg = location.pathname.split("/")[1]; f.repo.value = m[1] + "/" + (seg && !/\.html$/.test(seg) ? seg : m[1] + ".github.io"); }
+    $("#setupDone").hidden = true;
+    f.hidden = false;
+    show("screenSetup");
+  }
+
+  async function start(creds) {
+    C = creds;
+    show("screenApp");
+    $("#menuRepo").textContent = "Репозиторий: " + C.repo + " (" + C.branch + ") · сайт: " + siteBase();
+    renderCats();
+    try { await reload(); } catch (err) { $("#aList").innerHTML = '<p class="form-error">' + esc(err.message) + "</p>"; }
+  }
+
+  async function init() {
+    if (!window.isSecureContext || !window.crypto || !crypto.subtle) {
+      show("screenSetup");
+      $("#setupForm").hidden = true;
+      $("#screenSetup .steps").outerHTML = '<p class="form-error">Админка работает только по защищённому адресу (https). Откройте её на опубликованном сайте.</p>';
+      return;
+    }
+    var key = keyFromHash();
+    var creds = key && sessionCreds(key);
+    if (creds) return start(creds);
+    if (key) { $("#pinError").hidden = true; $("#pinForm").reset(); show("screenPin"); return; }
+    prefillSetup(null);
+  }
+  window.addEventListener("hashchange", init);
+
+  $("#setupForm").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var f = e.target, err = $("#setupError");
+    err.hidden = true;
+    try {
+      if (f.pin.value.length < 8) throw new Error("Пароль — минимум 8 символов.");
+      if (f.pin.value !== f.pin2.value) throw new Error("Пароли не совпадают.");
+      var creds = { repo: normRepo(f.repo.value), branch: f.branch.value.trim(), token: f.token.value.trim(), site: normBase(f.site.value) };
+      if (!/^[\w.-]+\/[\w.-]+$/.test(creds.repo)) throw new Error("Репозиторий пишется как владелец/название, например ivan/mebel-said.");
+      if (!/^https?:\/\/[^/]+/.test(creds.site)) throw new Error("Адрес сайта должен начинаться с https://, например https://example.com");
+      busy("Проверяю доступ к GitHub…");
+      await verify(creds);
+      var link = location.origin + location.pathname + "#key=" + (await seal(creds, f.pin.value));
+      busy(false);
+      f.reset();
+      f.hidden = true;
+      $("#adminLink").value = link;
+      $("#openLink").href = link;
+      $("#setupDone").hidden = false;
+    } catch (ex) { busy(false); fail(err, ex); }
+  });
+
+  $("#copyLink").addEventListener("click", function () {
+    var inp = $("#adminLink");
+    (navigator.clipboard ? navigator.clipboard.writeText(inp.value) : Promise.reject()).then(
+      function () { toast("Ссылка скопирована"); },
+      function () { inp.select(); document.execCommand("copy"); toast("Ссылка скопирована"); });
+  });
+
+  // Небольшая пауза после неудачных попыток, чтобы пароль было неудобно подбирать вручную
+  $("#pinForm").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var err = $("#pinError"), key = keyFromHash();
+    var lock = +(LS && LS.getItem("ff-admin-lock")) || 0;
+    if (Date.now() < lock) return fail(err, new Error("Слишком много попыток. Подождите " + Math.ceil((lock - Date.now()) / 1000) + " с."));
+    busy("Проверяю пароль…");
+    try {
+      var creds = await unseal(key, e.target.pin.value);
+      busy("Проверяю доступ к GitHub…");
+      await verify(creds);
+      if (LS) LS.removeItem("ff-admin-fails");
+      if (SS) SS.setItem("ff-admin", JSON.stringify({ key: key, creds: creds }));
+      busy(false);
+      start(creds);
+    } catch (ex) {
+      busy(false);
+      if (ex.name === "OperationError") {
+        var fails = (+(LS && LS.getItem("ff-admin-fails")) || 0) + 1;
+        if (LS) { LS.setItem("ff-admin-fails", fails); if (fails >= 5) { LS.setItem("ff-admin-lock", Date.now() + 60000); LS.setItem("ff-admin-fails", 0); } }
+        fail(err, new Error("Неверный пароль."));
+      } else fail(err, ex);
+    }
+  });
+
+  /* ---------- Обработчики админки ---------- */
+  var debounceQ;
+  $("#aQ").addEventListener("input", function () {
+    clearTimeout(debounceQ);
+    var v = this.value;
+    debounceQ = setTimeout(function () { S.q = v; renderList(); }, 120);
+  });
+  $("#eFiles").addEventListener("change", function () { addFiles(this.files).then(function () { $("#eFiles").value = ""; }); });
+  $("#editForm").addEventListener("input", function () { if (E) E.dirty = true; });
+  $("#eType").addEventListener("change", function (e) { e.target.parentNode.classList.toggle("is-on", e.target.checked); });
+  $("#editForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    $("#editError").hidden = true;
+    save().catch(function (ex) { busy(false); fail($("#editError"), ex); });
+  });
+  $("#deleteBtn").addEventListener("click", function () {
+    removeItem().catch(function (ex) { busy(false); fail($("#editError"), ex); });
+  });
+  /* ---------- Контакты (блок в data/config.js) ---------- */
+  var CONTACTS_RE = /  \/\/ >>> КОНТАКТЫ[\s\S]*?\/\/ <<< КОНТАКТЫ\n/;
+  var CT = null;  // { repo, text, cur }
+  function socialRow(s) {
+    var div = document.createElement("div");
+    div.className = "social";
+    div.innerHTML = '<input name="title" placeholder="Название: MAX, Instagram, Адрес">' +
+      '<input name="text" placeholder="Подпись: @forest, ул. Ленина 5">' +
+      '<input name="url" inputmode="url" placeholder="Ссылка (необязательно): https://max.ru/…">' +
+      '<button class="icon-btn" type="button" data-rm-social aria-label="Удалить строку"><svg class="icon"><use href="#i-trash"/></svg></button>';
+    div.querySelector('[name="title"]').value = s.title || "";
+    div.querySelector('[name="text"]').value = s.text || "";
+    div.querySelector('[name="url"]').value = s.url || "";
+    return div;
+  }
+  async function openContacts() {
+    hideLayer($("#menuLayer"));
+    busy("Загружаю контакты…");
+    var repo = await loadRepo(S.cat);
+    var blob = await gh("/repos/" + C.repo + "/git/blobs/" + repo.paths["data/config.js"]);
+    var text = decodeB64Utf8(blob.content);
+    if (!CONTACTS_RE.test(text)) throw new Error("В data/config.js нет блока «>>> КОНТАКТЫ». Обновите сайт до последней версии.");
+    var sandbox = {}; new Function("window", text)(sandbox);  // свежие значения из репозитория, а не из открытой страницы
+    var cur = sandbox.SITE;
+    CT = { repo: repo, text: text, cur: cur };
+    var f = $("#contactsForm");
+    f.phone.value = cur.phone || ""; f.whatsapp.value = cur.whatsapp || ""; f.maxUrl.value = cur.maxUrl || "";
+    $("#cSocials").innerHTML = "";
+    (cur.socials || []).forEach(function (s) { $("#cSocials").appendChild(socialRow(s)); });
+    $("#contactsError").hidden = true;
+    busy(false);
+    openLayer($("#contactsLayer"));
+  }
+  function readContacts() {
+    var f = $("#contactsForm");
+    var phone = f.phone.value.trim();
+    var wa = f.whatsapp.value.replace(/\D/g, "");
+    var maxUrl = f.maxUrl.value.trim();
+    var digits = phone.replace(/\D/g, "");
+    if (digits.length === 11 && digits[0] === "8") digits = "7" + digits.slice(1);
+    if (digits.length < 10) throw new Error("Проверьте телефон — в нём меньше 10 цифр.");
+    if (wa.length < 10 || wa.length > 15) throw new Error("WhatsApp: нужен номер с кодом страны, 10–15 цифр, например 79640619138.");
+    if (!/^https:\/\/max\.ru\/u\/[A-Za-z0-9_-]+$/.test(maxUrl)) throw new Error("Укажите полную ссылку на профиль MAX.");
+    var socials = $$("#cSocials .social").map(function (row) {
+      return { title: row.querySelector('[name="title"]').value.trim(), text: row.querySelector('[name="text"]').value.trim(), url: row.querySelector('[name="url"]').value.trim() };
+    }).filter(function (s) { return s.title || s.text || s.url; });
+    socials.forEach(function (s) {
+      if (!s.title) throw new Error("У каждой строки должно быть название (например, MAX или Адрес).");
+      if (s.url && !/^(https?:\/\/|tel:|mailto:|tg:)/.test(s.url)) throw new Error("Ссылка «" + s.title + "» должна начинаться с https://");
+    });
+    return { phone: phone, phoneHref: "tel:+" + digits, whatsapp: wa, maxUrl: maxUrl, socials: socials };
+  }
+  function contactsBlock(v) {
+    return "  // >>> КОНТАКТЫ — меняются в админке (меню → «Контакты»)\n" +
+      "  phone: " + JSON.stringify(v.phone) + ",\n" +
+      "  phoneHref: " + JSON.stringify(v.phoneHref) + ",\n" +
+      "  whatsapp: " + JSON.stringify(v.whatsapp) + ",\n" +
+      "  maxUrl: " + JSON.stringify(v.maxUrl) + ",\n" +
+      "  // Дополнительные строки в окне «Связаться»: { title, text, url }. Пустой url — просто строка (адрес, режим работы)\n" +
+      "  socials: " + (v.socials.length ? "[\n" + v.socials.map(function (s) { return "    " + JSON.stringify(s) + ","; }).join("\n") + "\n  ]" : "[]") + ",\n" +
+      "  // <<< КОНТАКТЫ\n";
+  }
+  // QR-коды для окна «Связаться» на компьютере (библиотека грузится только при смене номера)
+  function loadQrLib() {
+    if (window.qrcode) return Promise.resolve();
+    return new Promise(function (ok, no) {
+      var s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js";
+      s.onload = ok; s.onerror = function () { no(new Error("Не удалось загрузить генератор QR-кодов — проверьте интернет.")); };
+      document.head.appendChild(s);
+    });
+  }
+  async function qrJpegB64(text) {
+    await loadQrLib();
+    var q = window.qrcode(0, "M"); q.addData(text); q.make();
+    var img = new Image();
+    await new Promise(function (ok) { img.onload = ok; img.src = q.createDataURL(10, 2); });
+    var c = document.createElement("canvas"); c.width = c.height = 480;
+    var x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, 480, 480); x.imageSmoothingEnabled = false; x.drawImage(img, 0, 0, 480, 480);
+    return c.toDataURL("image/jpeg", 0.92).split(",")[1];
+  }
+  async function saveContacts() {
+    var v = readContacts(), cur = CT.cur, changes = [];
+    if (v.phone !== cur.phone) changes.push("Телефон: " + cur.phone + " → " + v.phone);
+    if (v.whatsapp !== cur.whatsapp) changes.push("WhatsApp: +" + cur.whatsapp + " → +" + v.whatsapp);
+    if (v.maxUrl !== cur.maxUrl) changes.push("MAX: " + cur.maxUrl + " → " + v.maxUrl);
+    if (JSON.stringify(v.socials) !== JSON.stringify(cur.socials || [])) changes.push("Другие строки: " + (v.socials.map(function (s) { return s.title; }).join(", ") || "нет"));
+    if (!changes.length) { toast("Ничего не изменилось."); return; }
+    if (!confirm("Вы точно хотите изменить контакты на сайте?\n\n" + changes.join("\n"))) return;
+    var numbers = v.whatsapp !== cur.whatsapp || v.maxUrl !== cur.maxUrl || v.phone !== cur.phone;
+    if (numbers && !confirm("Проверьте ещё раз — с этого момента заявки клиентов будут приходить сюда:\n\n" +
+        "WhatsApp: +" + v.whatsapp + "\nMAX: " + v.maxUrl + "\nТелефон: " + v.phone + "\n\nВсё верно?")) return;
+    busy("Сохраняю контакты…");
+    var entries = [{ path: "data/config.js", content: CT.text.replace(CONTACTS_RE, function () { return contactsBlock(v); }) }];
+    if (v.whatsapp !== cur.whatsapp) entries.push({ path: "assets/img/qr-whatsapp.jpg", sha: await uploadBlob(await qrJpegB64("https://wa.me/" + v.whatsapp)) });
+    if (v.maxUrl !== cur.maxUrl) entries.push({ path: "assets/img/qr-max.jpg", sha: await uploadBlob(await qrJpegB64(v.maxUrl)) });
+    var fresh = await loadRepo(S.cat);  // свежий коммит: вдруг за это время сохраняли модель
+    await commit(fresh, "Админка: изменены контакты", entries);
+    Object.assign(SITE, v);
+    busy(false);
+    closeLayer($("#contactsLayer"));
+    toast("Контакты сохранены. На сайте обновятся через 1–2 минуты.");
+  }
+  $("#openContacts").addEventListener("click", function () { openContacts().catch(function (ex) { busy(false); toast(ex.message); }); });
+  $("#cAddSocial").addEventListener("click", function () { $("#cSocials").appendChild(socialRow({})); });
+  $("#cSocials").addEventListener("click", function (e) { var b = e.target.closest("[data-rm-social]"); if (b) b.closest(".social").remove(); });
+  $("#contactsForm").addEventListener("submit", function (e) {
+    e.preventDefault();
+    $("#contactsError").hidden = true;
+    saveContacts().catch(function (ex) { busy(false); $("#contactsError").textContent = ex.message; $("#contactsError").hidden = false; });
+  });
+
+  $("#rebuildShare").addEventListener("click", function () {
+    rebuildShare().catch(function (ex) { busy(false); toast(ex.message); });
+  });
+  $("#newLink").addEventListener("click", function () {
+    hideLayer($("#menuLayer"));
+    prefillSetup(C);
+  });
+  $("#logout").addEventListener("click", function () {
+    if (SS) SS.removeItem("ff-admin");
+    C = null;
+    hideLayer($("#menuLayer"));
+    init();
+  });
+  $("#addBtn").addEventListener("click", function () { if (S.repo) openEditor(null); });
+  $("#orderCancel").addEventListener("click", function () { S.order = null; renderList(); });
+  $("#orderSave").addEventListener("click", function () { saveOrder().catch(function (ex) { busy(false); toast(ex.message); }); });
+  $("#menuBtn").addEventListener("click", function () { openLayer($("#menuLayer")); });
+
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest("button, [data-close]");
+    if (!t) return;
+    var d = t.dataset;
+    if (d.close !== undefined) { closeLayer(t.closest(".layer")); return; }
+    if (d.order) { moveItem(+d.id, d.order === "top" ? "top" : +d.order); return; }
+    if (d.edit) { openEditor(S.repo.items.filter(function (p) { return p.id === +d.edit; })[0]); return; }
+    if (d.cat) {
+      if (S.order && !confirm("Порядок не сохранён. Перейти в другой раздел без сохранения?")) return;
+      S.order = null;
+      S.cat = SITE.categories.filter(function (c) { return c.id === d.cat; })[0];
+      renderCats();
+      $("#aList").innerHTML = '<p class="muted">Загружаю…</p>';
+      reload().catch(function (ex) { toast(ex.message); });
+      return;
+    }
+    if (d.move) {
+      var i = +d.move, j = i + +d.dir, tmp = E.photos[i];
+      E.photos[i] = E.photos[j]; E.photos[j] = tmp; E.dirty = true;
+      renderPhotos();
+      return;
+    }
+    if (d.drop) { E.photos.splice(+d.drop, 1); E.dirty = true; renderPhotos(); return; }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { var l = $(".layer.is-open"); if (l) closeLayer(l); }
+  });
+
+  init();
+})();
