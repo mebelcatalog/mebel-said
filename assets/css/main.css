@@ -744,3 +744,12 @@ html.has-cart .toast { bottom: calc(16px + var(--cart-h, 0px)); }
 .brand img {object-fit:cover;}
 .home-h2,.home-cat-text b {font-family:Georgia,serif;}
 @media(max-width:720px){.home-hero{grid-template-columns:1fr}.hero-identity{max-width:none;width:100%}.hero-identity img{height:auto}.hero-content{padding:18px 20px 24px}.hero-content .home-cta .btn{flex:1 1 auto}}
+
+/* Стулья — палитра и типографика SAID, полный кадр. */
+.car--chairs .car-track { aspect-ratio: 3 / 4; }
+.car--chairs .car-slide img { object-fit: contain; }
+.card:has(.car--chairs) { border-color: var(--line-strong); }
+.car--chairs .tag--num { background: var(--accent); color: var(--accent-ink); }
+.related-group + .related-group { margin-top: 16px; }
+.related[href^="chairs/"] img, .home-cat[href="chairs/"] img { object-fit: contain; }
+
